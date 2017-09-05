@@ -1,22 +1,19 @@
 import requests
+import six
 import platform
 from numbers import Number
 import xml.etree.cElementTree as xml
 from collections import namedtuple
 
-py_majversion, py_minversion, py_revversion = platform.python_version_tuple()
-
-if py_majversion == '2':
-    from httplib import responses as HTTP_CODES
-    from urlparse import urlparse
-else:
-    from http.client import responses as HTTP_CODES
-    from urllib.parse import urlparse
+from six.moves.urllib_parse import urlparse, quote
+from six.moves.http_client import responses as HTTP_CODES
 
 DOWNLOAD_CHUNK_SIZE_BYTES = 1 * 1024 * 1024
 
+
 class WebdavException(Exception):
     pass
+
 
 class ConnectionFailed(WebdavException):
     pass
@@ -31,7 +28,20 @@ File = namedtuple('File', ['name', 'size', 'mtime', 'ctime', 'contenttype'])
 
 def prop(elem, name, default=None):
     child = elem.find('.//{DAV:}' + name)
-    return default if child is None else child.text
+    if child is None:
+        return default
+    if child.text is None:
+        return default
+    return child.text
+
+
+def getrealcontenttype(elem):
+    resource_type = elem.find('.//{DAV:}resourcetype')
+    if resource_type is not None:
+        coll = resource_type.find('.//{DAV:}collection')
+        if coll is not None:
+            return "httpd/unix-directory"
+    return prop(elem, 'getcontenttype', '')
 
 
 def elem2file(elem):
@@ -40,18 +50,19 @@ def elem2file(elem):
         int(prop(elem, 'getcontentlength', 0)),
         prop(elem, 'getlastmodified', ''),
         prop(elem, 'creationdate', ''),
-        prop(elem, 'getcontenttype', ''),
+        getrealcontenttype(elem),
     )
 
 
 class OperationFailed(WebdavException):
     _OPERATIONS = dict(
-        HEAD = "get header",
-        GET = "download",
-        PUT = "upload",
-        DELETE = "delete",
-        MKCOL = "create directory",
-        PROPFIND = "list directory",
+        HEAD="get header",
+        GET="download",
+        PUT="upload",
+        DELETE="delete",
+        MKCOL="create directory",
+        PROPFIND="list directory",
+        MOVE="move file",
         )
 
     def __init__(self, method, path, expected_code, actual_code):
@@ -70,6 +81,7 @@ class OperationFailed(WebdavException):
   Expected code :  {expected_codes_str}
   Actual code   :  {actual_code} {actual_code_str}'''.format(**locals())
         super(OperationFailed, self).__init__(msg)
+
 
 class Client(object):
     def __init__(self, host, port=0, auth=None, username=None, password=None,
@@ -94,14 +106,15 @@ class Client(object):
 
     def _send(self, method, path, expected_code, **kwargs):
         url = self._get_url(path)
-        response = self.session.request(method, url, allow_redirects=False, **kwargs)
-        if isinstance(expected_code, Number) and response.status_code != expected_code \
-            or not isinstance(expected_code, Number) and response.status_code not in expected_code:
+        response = self.session.request(method, url, allow_redirects=True, **kwargs)
+        if isinstance(expected_code, Number) \
+                and response.status_code != expected_code \
+                or not isinstance(expected_code, Number) and response.status_code not in expected_code:
             raise OperationFailed(method, path, expected_code, response.status_code)
         return response
 
     def _get_url(self, path):
-        path = str(path).strip()
+        path = quote(str(path).strip())
         if path.startswith('/'):
             return self.baseurl + path
         return "".join((self.baseurl, self.cwd, path))
@@ -118,11 +131,11 @@ class Client(object):
         else:
             self.cwd += stripped_path
 
-    def mkdir(self, path, safe=False):
+    def mkdir(self, path, safe=False, **kwargs):
         expected_codes = 201 if not safe else (201, 301, 405)
-        self._send('MKCOL', path, expected_codes)
+        self._send('MKCOL', path, expected_codes, **kwargs)
 
-    def mkdirs(self, path):
+    def mkdirs(self, path, **kwargs):
         dirs = [d for d in path.split('/') if d]
         if not dirs:
             return
@@ -130,50 +143,57 @@ class Client(object):
             dirs[0] = '/' + dirs[0]
         old_cwd = self.cwd
         try:
-            for dir in dirs:
+            for dir_ in dirs:
                 try:
-                    self.mkdir(dir, safe=True)
+                    self.mkdir(dir, safe=True, **kwargs)
                 except Exception as e:
                     if e.actual_code == 409:
                         raise
                 finally:
-                    self.cd(dir)
+                    self.cd(dir_)
         finally:
             self.cd(old_cwd)
 
-    def rmdir(self, path, safe=False):
+    def rmdir(self, path, safe=False, **kwargs):
         path = str(path).rstrip('/') + '/'
-        expected_codes = 204 if not safe else (204, 404)
-        self._send('DELETE', path, expected_codes)
+        expected_codes = (200, 204) if not safe else (200, 204, 404)
+        self._send('DELETE', path, expected_codes, **kwargs)
 
-    def delete(self, path):
-        self._send('DELETE', path, 204)
+    def delete(self, path, **kwargs):
+        self._send('DELETE', path, (200, 204), **kwargs)
 
-    def upload(self, local_path_or_fileobj, remote_path):
-        if isinstance(local_path_or_fileobj, basestring):
+    def move(self, path, new_path, **kwargs):
+        self._send('MOVE', path, (201, 204),
+                   headers={"Destination": new_path, 'Connection': 'TE', 'TE': 'trailers', 'Overwrite': 'T'}, **kwargs)
+
+    def upload(self, local_path_or_fileobj, remote_path, **kwargs):
+        if isinstance(local_path_or_fileobj, six.string_types):
             with open(local_path_or_fileobj, 'rb') as f:
                 self._upload(f, remote_path)
         else:
-            self._upload(local_path_or_fileobj, remote_path)
+            self._upload(local_path_or_fileobj, remote_path, **kwargs)
 
-    def _upload(self, fileobj, remote_path):
-        self._send('PUT', remote_path, (200, 201, 204), data=fileobj)
+    def _upload(self, fileobj, remote_path, **kwargs):
+        self._send('PUT', remote_path, (200, 201, 204),
+                   data=fileobj, **kwargs)
 
-    def download(self, remote_path, local_path_or_fileobj):
-        response = self._send('GET', remote_path, 200, stream=True)
-        if isinstance(local_path_or_fileobj, basestring):
+    def download(self, remote_path, local_path_or_fileobj, **kwargs):
+        response = self._send('GET', remote_path, 200, stream=True, **kwargs)
+        if isinstance(local_path_or_fileobj, six.string_types):
             with open(local_path_or_fileobj, 'wb') as f:
                 self._download(f, response)
         else:
             self._download(local_path_or_fileobj, response)
 
-    def _download(self, fileobj, response):
+    @staticmethod
+    def _download(fileobj, response):
         for chunk in response.iter_content(DOWNLOAD_CHUNK_SIZE_BYTES):
-            fileobj.write(chunk)
+            fileobj.write(six.u(chunk))
 
-    def ls(self, remote_path='.'):
+    def ls(self, remote_path='.', **kwargs):
         headers = {'Depth': '1'}
-        response = self._send('PROPFIND', remote_path, (207, 301), headers=headers)
+        response = self._send('PROPFIND', remote_path, (207, 301),
+                              headers=headers, **kwargs)
 
         # Redirect
         if response.status_code == 301:
