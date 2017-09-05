@@ -1,4 +1,5 @@
-EasyWebDAV: A WebDAV Client in Python
+EasyWebDAV2: Is a fork of EasyWebDAV library with included pull requests and some additional fixes.
+A WebDAV Client in Python
 =====================================
 
 Features
