@@ -145,7 +145,7 @@ class Client(object):
         try:
             for dir_ in dirs:
                 try:
-                    self.mkdir(dir, safe=True, **kwargs)
+                    self.mkdir(dir_, safe=True, **kwargs)
                 except Exception as e:
                     if e.actual_code == 409:
                         raise
